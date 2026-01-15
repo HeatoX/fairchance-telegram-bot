@@ -1,21 +1,16 @@
 // ============================================
 // FairChance Lottery - Bot de Alertas Telegram
 // ============================================
-// Este script monitorea el contrato y envía alertas 
-// a un grupo de Telegram cuando alguien compra tickets.
-// Versión: Polling (más estable que WebSocket)
+// Versión: BscScan API (más estable que RPC)
 
 require('dotenv').config();
 const { ethers } = require('ethers');
 const TelegramBot = require('node-telegram-bot-api');
+const https = require('https');
 
 // --- CONFIGURACIÓN ---
 const CONFIG = {
-    // Tu contrato de lotería en BSC
     CONTRACT_ADDRESS: '0x59d2A5a1518f331550d680A8C777A1c5F0F4D38d',
-
-    // RPC de BSC Mainnet (Ankr es más permisivo con getLogs)
-    BSC_RPC: 'https://rpc.ankr.com/bsc',
 
     // Token del bot de Telegram
     TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8297009961:AAG7NweIXk5k7ryokbWJ8Elsbqd_oNN4JaE',
@@ -26,28 +21,37 @@ const CONFIG = {
     // Precio aproximado de BNB en USD
     BNB_PRICE_USD: 600,
 
-    // Intervalo de polling en ms (15 segundos)
-    POLL_INTERVAL: 15000
+    // Intervalo de polling (60 segundos para evitar rate limits de BscScan)
+    POLL_INTERVAL: 60000
 };
 
-// ABI mínimo para leer eventos
-const CONTRACT_ABI = [
-    "event NewTicketBought(address indexed player, uint256 amount)",
-    "event WinnerPicked(address indexed winner, uint256 prize, uint256 lotteryId)",
-    "event LotteryExtended(uint256 newEndTime, uint256 currentPool)"
-];
-
-// Provider y contrato
-const provider = new ethers.providers.JsonRpcProvider(CONFIG.BSC_RPC);
-const contract = new ethers.Contract(CONFIG.CONTRACT_ADDRESS, CONTRACT_ABI, provider);
+// Topic hash para evento NewTicketBought(address,uint256)
+const TICKET_BOUGHT_TOPIC = '0x5aa751d731debbe10def42d9ad6bf03d78e05b6a01826eb28384e11ea05b78c8';
 
 // Bot de Telegram
 const bot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { polling: false });
 
-// Estado para trackear el último bloque procesado
+// Estado
 let lastProcessedBlock = 0;
+let processedTxHashes = new Set();
 
 // --- FUNCIONES ---
+
+function httpGet(url) {
+    return new Promise((resolve, reject) => {
+        https.get(url, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    resolve(JSON.parse(data));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        }).on('error', reject);
+    });
+}
 
 async function sendTelegramMessage(message) {
     try {
@@ -56,8 +60,10 @@ async function sendTelegramMessage(message) {
             disable_web_page_preview: true
         });
         console.log('✅ Mensaje enviado a Telegram');
+        return true;
     } catch (error) {
         console.error('❌ Error enviando mensaje:', error.message);
+        return false;
     }
 }
 
@@ -65,24 +71,55 @@ function formatAddress(address) {
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
-// Procesar evento de compra de tickets
-async function processTicketBought(event) {
-    const player = event.args.player;
-    const amount = event.args.amount;
-    const txHash = event.transactionHash;
+// Obtener balance del contrato
+async function getContractBalance() {
+    try {
+        const url = `https://api.bscscan.com/api?module=account&action=balance&address=${CONFIG.CONTRACT_ADDRESS}&tag=latest`;
+        const response = await httpGet(url);
+        if (response.status === '1') {
+            const balanceWei = response.result;
+            const balanceBNB = parseFloat(ethers.utils.formatEther(balanceWei));
+            return balanceBNB;
+        }
+    } catch (error) {
+        console.error('Error obteniendo balance:', error.message);
+    }
+    return 0;
+}
 
-    console.log(`🎟️ Nueva compra detectada: ${amount} tickets de ${formatAddress(player)}`);
+// Obtener transacciones recientes al contrato
+async function getRecentTransactions() {
+    try {
+        const url = `https://api.bscscan.com/api?module=account&action=txlist&address=${CONFIG.CONTRACT_ADDRESS}&startblock=0&endblock=99999999&page=1&offset=20&sort=desc`;
+        const response = await httpGet(url);
+
+        if (response.status === '1' && response.result) {
+            return response.result;
+        }
+    } catch (error) {
+        console.error('Error obteniendo transacciones:', error.message);
+    }
+    return [];
+}
+
+// Procesar nueva compra
+async function processTicketPurchase(tx) {
+    const player = tx.from;
+    const txHash = tx.hash;
+    const valueBNB = parseFloat(ethers.utils.formatEther(tx.value));
+    const tickets = Math.round(valueBNB / 0.002); // Precio por ticket = 0.002 BNB
+
+    console.log(`🎟️ Nueva compra: ${tickets} tickets de ${formatAddress(player)}`);
 
     // Obtener balance actual
-    const balance = await provider.getBalance(CONFIG.CONTRACT_ADDRESS);
-    const balanceBNB = parseFloat(ethers.utils.formatEther(balance));
+    const balanceBNB = await getContractBalance();
     const balanceUSD = (balanceBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
 
     const message = `
 🎟️ <b>¡NUEVA COMPRA DE TICKETS!</b>
 
 👤 <b>Jugador:</b> <code>${formatAddress(player)}</code>
-🎫 <b>Tickets:</b> ${amount.toString()}
+🎫 <b>Tickets:</b> ${tickets}
 💰 <b>Pozo Actual:</b> $${balanceUSD} USD
 
 <a href="https://bscscan.com/tx/${txHash}">🔗 Ver en BscScan</a>
@@ -92,71 +129,58 @@ async function processTicketBought(event) {
     await sendTelegramMessage(message);
 }
 
-// Procesar evento de ganador
-async function processWinnerPicked(event) {
-    const winner = event.args.winner;
-    const prize = event.args.prize;
-    const lotteryId = event.args.lotteryId;
-    const txHash = event.transactionHash;
-
-    const prizeBNB = parseFloat(ethers.utils.formatEther(prize));
-    const prizeUSD = (prizeBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
-
-    console.log(`🏆 Ganador detectado: ${formatAddress(winner)} - $${prizeUSD}`);
-
-    const message = `
-🏆🏆🏆 <b>¡TENEMOS GANADOR!</b> 🏆🏆🏆
-
-🎉 <b>Ronda:</b> #${lotteryId.toString()}
-👑 <b>Ganador:</b> <code>${formatAddress(winner)}</code>
-💵 <b>Premio:</b> <b>$${prizeUSD} USD</b> (${prizeBNB.toFixed(4)} BNB)
-
-¡El dinero ya fue enviado automáticamente!
-
-<a href="https://bscscan.com/tx/${txHash}">✅ Verificar Pago</a>
-<a href="https://heatox.github.io/loteria-crypto/">🎰 ¡Nueva Ronda Iniciada!</a>
-`;
-
-    await sendTelegramMessage(message);
-}
-
 // Función principal de polling
-async function pollForEvents() {
+async function pollForTransactions() {
     try {
-        const currentBlock = await provider.getBlockNumber();
+        console.log('🔍 Buscando nuevas transacciones...');
 
-        // Primera ejecución: obtener bloque actual
-        if (lastProcessedBlock === 0) {
-            lastProcessedBlock = currentBlock - 10; // Empezar 10 bloques atrás
-            console.log(`📦 Iniciando desde bloque ${lastProcessedBlock}`);
+        const transactions = await getRecentTransactions();
+
+        if (transactions.length === 0) {
+            console.log('📭 No hay transacciones recientes');
+            return;
         }
 
-        // Solo buscar si hay bloques nuevos
-        if (currentBlock > lastProcessedBlock) {
-            console.log(`🔍 Buscando eventos del bloque ${lastProcessedBlock + 1} al ${currentBlock}`);
+        // Obtener el bloque más reciente para inicializar
+        if (lastProcessedBlock === 0) {
+            lastProcessedBlock = parseInt(transactions[0].blockNumber);
+            // Marcar las últimas 5 transacciones como procesadas para no spam inicial
+            transactions.slice(0, 5).forEach(tx => processedTxHashes.add(tx.hash));
+            console.log(`📦 Iniciando desde bloque ${lastProcessedBlock}`);
+            return;
+        }
 
-            // Buscar eventos NewTicketBought
-            const ticketFilter = contract.filters.NewTicketBought();
-            const ticketEvents = await contract.queryFilter(ticketFilter, lastProcessedBlock + 1, currentBlock);
+        // Procesar transacciones nuevas (que no hayamos visto)
+        for (const tx of transactions) {
+            // Solo procesar transacciones entrantes (TO = contrato)
+            if (tx.to.toLowerCase() !== CONFIG.CONTRACT_ADDRESS.toLowerCase()) continue;
 
-            for (const event of ticketEvents) {
-                await processTicketBought(event);
+            // Solo transacciones exitosas
+            if (tx.txreceipt_status !== '1') continue;
+
+            // Solo transacciones con valor (compras)
+            if (tx.value === '0') continue;
+
+            // No procesar si ya la vimos
+            if (processedTxHashes.has(tx.hash)) continue;
+
+            // Marcar como procesada
+            processedTxHashes.add(tx.hash);
+
+            // Procesar la compra
+            await processTicketPurchase(tx);
+
+            // Actualizar último bloque
+            const blockNum = parseInt(tx.blockNumber);
+            if (blockNum > lastProcessedBlock) {
+                lastProcessedBlock = blockNum;
             }
+        }
 
-            // Buscar eventos WinnerPicked
-            const winnerFilter = contract.filters.WinnerPicked();
-            const winnerEvents = await contract.queryFilter(winnerFilter, lastProcessedBlock + 1, currentBlock);
-
-            for (const event of winnerEvents) {
-                await processWinnerPicked(event);
-            }
-
-            // Actualizar último bloque procesado
-            lastProcessedBlock = currentBlock;
-
-            if (ticketEvents.length > 0 || winnerEvents.length > 0) {
-                console.log(`✅ Procesados ${ticketEvents.length} compras y ${winnerEvents.length} ganadores`);
-            }
+        // Limpiar hashes viejos (mantener solo los últimos 100)
+        if (processedTxHashes.size > 100) {
+            const arr = Array.from(processedTxHashes);
+            processedTxHashes = new Set(arr.slice(-50));
         }
 
     } catch (error) {
@@ -171,8 +195,8 @@ console.log('💬 Enviando alertas a Telegram Chat ID:', CONFIG.TELEGRAM_CHAT_ID
 console.log(`⏰ Polling cada ${CONFIG.POLL_INTERVAL / 1000} segundos`);
 
 // Ejecutar polling inmediatamente y luego cada X segundos
-pollForEvents();
-setInterval(pollForEvents, CONFIG.POLL_INTERVAL);
+pollForTransactions();
+setInterval(pollForTransactions, CONFIG.POLL_INTERVAL);
 
 // Keep-alive log cada 60 segundos
 setInterval(() => {
