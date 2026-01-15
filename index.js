@@ -1,16 +1,22 @@
 // ============================================
 // FairChance Lottery - Bot de Alertas Telegram
 // ============================================
-// Versión: BscScan API (más estable que RPC)
+// Versión: Block Watcher (100% RPC Público - Sin APIs externas)
 
 require('dotenv').config();
 const { ethers } = require('ethers');
 const TelegramBot = require('node-telegram-bot-api');
-const https = require('https');
 
 // --- CONFIGURACIÓN ---
 const CONFIG = {
     CONTRACT_ADDRESS: '0x59d2A5a1518f331550d680A8C777A1c5F0F4D38d',
+
+    // RPCs de respaldo (Rotación simple)
+    RPCS: [
+        'https://rpc.ankr.com/bsc',
+        'https://bsc-dataseed1.binance.org/',
+        'https://bsc-dataseed2.binance.org/'
+    ],
 
     // Token del bot de Telegram
     TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8297009961:AAG7NweIXk5k7ryokbWJ8Elsbqd_oNN4JaE',
@@ -21,36 +27,42 @@ const CONFIG = {
     // Precio aproximado de BNB en USD
     BNB_PRICE_USD: 600,
 
-    // Intervalo de polling (60 segundos para evitar rate limits de BscScan)
-    POLL_INTERVAL: 60000
+    // Intervalo de chequeo de bloques (5 segundos)
+    POLL_INTERVAL: 5000
 };
 
-// Topic hash para evento NewTicketBought(address,uint256)
-const TICKET_BOUGHT_TOPIC = '0x5aa751d731debbe10def42d9ad6bf03d78e05b6a01826eb28384e11ea05b78c8';
+// ABI para decodificar logs
+const CONTRACT_ABI = [
+    "event NewTicketBought(address indexed player, uint256 amount)",
+    "event WinnerPicked(address indexed winner, uint256 prize, uint256 lotteryId)",
+    "event LotteryExtended(uint256 newEndTime, uint256 currentPool)"
+];
 
-// Bot de Telegram
+// Inicializar
+let currentRpcIndex = 0;
+let provider = new ethers.providers.JsonRpcProvider(CONFIG.RPCS[0]);
+let contractInterface = new ethers.utils.Interface(CONTRACT_ABI);
 const bot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { polling: false });
 
 // Estado
 let lastProcessedBlock = 0;
-let processedTxHashes = new Set();
+let isProcessing = false;
 
-// --- FUNCIONES ---
+// --- FUNCIONES AUXILIARES ---
 
-function httpGet(url) {
-    return new Promise((resolve, reject) => {
-        https.get(url, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                try {
-                    resolve(JSON.parse(data));
-                } catch (e) {
-                    reject(e);
-                }
-            });
-        }).on('error', reject);
-    });
+function getProvider() {
+    return provider;
+}
+
+function rotateRpc() {
+    currentRpcIndex = (currentRpcIndex + 1) % CONFIG.RPCS.length;
+    console.log(`🔄 Cambiando a RPC: ${CONFIG.RPCS[currentRpcIndex]}`);
+    provider = new ethers.providers.JsonRpcProvider(CONFIG.RPCS[currentRpcIndex]);
+}
+
+function formatAddress(address) {
+    if (!address) return 'Unknown';
+    return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
 async function sendTelegramMessage(message) {
@@ -60,162 +72,160 @@ async function sendTelegramMessage(message) {
             disable_web_page_preview: true
         });
         console.log('✅ Mensaje enviado a Telegram');
-        return true;
     } catch (error) {
         console.error('❌ Error enviando mensaje:', error.message);
-        return false;
     }
 }
 
-function formatAddress(address) {
-    return `${address.slice(0, 6)}...${address.slice(-4)}`;
-}
+// --- PROCESAMIENTO ---
 
-// Obtener balance del contrato
-async function getContractBalance() {
+async function processLog(log, txHash) {
     try {
-        const url = `https://api.bscscan.com/api?module=account&action=balance&address=${CONFIG.CONTRACT_ADDRESS}&tag=latest`;
-        const response = await httpGet(url);
-        if (response.status === '1') {
-            const balanceWei = response.result;
-            const balanceBNB = parseFloat(ethers.utils.formatEther(balanceWei));
-            return balanceBNB;
-        }
-    } catch (error) {
-        console.error('Error obteniendo balance:', error.message);
-    }
-    return 0;
-}
+        const parsedLog = contractInterface.parseLog(log);
 
-// Obtener transacciones recientes al contrato
-async function getRecentTransactions() {
-    try {
-        // Usar API V2 de BscScan (chainid 56 = BSC Mainnet)
-        const url = `https://api.bscscan.com/v2/api?chainid=56&module=account&action=txlist&address=${CONFIG.CONTRACT_ADDRESS}&startblock=0&endblock=99999999&page=1&offset=20&sort=desc`;
-        console.log(`📡 Consultando BscScan V2: ${url}`);
+        if (parsedLog.name === 'NewTicketBought') {
+            const player = parsedLog.args.player;
+            const amount = parsedLog.args.amount.toString();
 
-        const response = await httpGet(url);
-        console.log('🔍 Respuesta BscScan:', JSON.stringify(response).slice(0, 200) + '...');
+            console.log(`🎟️ Nueva compra detectada: ${amount} tickets de ${formatAddress(player)}`);
 
-        if (response.status === '1' && Array.isArray(response.result)) {
-            return response.result;
-        } else {
-            console.warn('⚠️ BscScan respuesta no-exitosa:', response.message);
-        }
-    } catch (error) {
-        console.error('Error obteniendo transacciones:', error.message);
-    }
-    return [];
-}
+            // Obtener balance para mostrar pozo
+            let balanceUSD = '0.00';
+            try {
+                const balance = await provider.getBalance(CONFIG.CONTRACT_ADDRESS);
+                const balanceBNB = parseFloat(ethers.utils.formatEther(balance));
+                balanceUSD = (balanceBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
+            } catch (e) { console.error('Error leyendo balance', e.message); }
 
-// Procesar nueva compra
-async function processTicketPurchase(tx) {
-    const player = tx.from;
-    const txHash = tx.hash;
-    const valueBNB = parseFloat(ethers.utils.formatEther(tx.value));
-    const tickets = Math.round(valueBNB / 0.002); // Precio por ticket = 0.002 BNB
-
-    console.log(`🎟️ Nueva compra: ${tickets} tickets de ${formatAddress(player)}`);
-
-    // Obtener balance actual
-    const balanceBNB = await getContractBalance();
-    const balanceUSD = (balanceBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
-
-    const message = `
+            const message = `
 🎟️ <b>¡NUEVA COMPRA DE TICKETS!</b>
 
 👤 <b>Jugador:</b> <code>${formatAddress(player)}</code>
-🎫 <b>Tickets:</b> ${tickets}
+🎫 <b>Tickets:</b> ${amount}
 💰 <b>Pozo Actual:</b> $${balanceUSD} USD
 
 <a href="https://bscscan.com/tx/${txHash}">🔗 Ver en BscScan</a>
 <a href="https://heatox.github.io/loteria-crypto/">🎰 Comprar Tickets</a>
 `;
+            await sendTelegramMessage(message);
 
-    await sendTelegramMessage(message);
+        } else if (parsedLog.name === 'WinnerPicked') {
+            const winner = parsedLog.args.winner;
+            const prize = parsedLog.args.prize;
+            const lotteryId = parsedLog.args.lotteryId.toString();
+
+            const prizeBNB = parseFloat(ethers.utils.formatEther(prize));
+            const prizeUSD = (prizeBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
+
+            console.log(`� Ganador detectado: ${formatAddress(winner)}`);
+
+            const message = `
+�🏆🏆 <b>¡TENEMOS GANADOR!</b> 🏆🏆🏆
+
+🎉 <b>Ronda:</b> #${lotteryId}
+� <b>Ganador:</b> <code>${formatAddress(winner)}</code>
+💵 <b>Premio:</b> <b>$${prizeUSD} USD</b> (${prizeBNB.toFixed(4)} BNB)
+
+¡El dinero ya fue enviado automáticamente!
+
+<a href="https://bscscan.com/tx/${txHash}">✅ Verificar Pago</a>
+<a href="https://heatox.github.io/loteria-crypto/">🎰 ¡Nueva Ronda Iniciada!</a>
+`;
+            await sendTelegramMessage(message);
+        }
+
+    } catch (e) {
+        // El log no pertenece a nuestro ABI, ignorar
+    }
 }
 
-// Función principal de polling
-async function pollForTransactions() {
+async function checkNewBlocks() {
+    if (isProcessing) return;
+    isProcessing = true;
+
     try {
-        console.log('🔍 Buscando nuevas transacciones...');
+        const currentBlock = await provider.getBlockNumber();
 
-        const transactions = await getRecentTransactions();
-
-        if (transactions.length === 0) {
-            console.log('📭 No hay transacciones recientes');
-            return;
-        }
-
-        // Obtener el bloque más reciente para inicializar
+        // Inicialización
         if (lastProcessedBlock === 0) {
-            lastProcessedBlock = parseInt(transactions[0].blockNumber);
-            // Marcar las últimas 5 transacciones como procesadas para no spam inicial
-            transactions.slice(0, 5).forEach(tx => processedTxHashes.add(tx.hash));
-            console.log(`📦 Iniciando desde bloque ${lastProcessedBlock}`);
+            lastProcessedBlock = currentBlock;
+            console.log(`🏁 Iniciando monitoreo desde bloque: ${lastProcessedBlock}`);
+            isProcessing = false;
             return;
         }
 
-        // Procesar transacciones nuevas (que no hayamos visto)
-        for (const tx of transactions) {
-            // Solo procesar transacciones entrantes (TO = contrato)
-            if (tx.to.toLowerCase() !== CONFIG.CONTRACT_ADDRESS.toLowerCase()) continue;
+        // Si no hay bloques nuevos
+        if (currentBlock <= lastProcessedBlock) {
+            isProcessing = false;
+            return;
+        }
 
-            // Solo transacciones exitosas
-            if (tx.txreceipt_status !== '1') continue;
+        // Procesar bloques pendientes (uno por uno para no saturar)
+        // Solo procesamos un máximo de 5 bloques de golpe para evitar lag
+        const startBlock = lastProcessedBlock + 1;
+        const endBlock = Math.min(currentBlock, lastProcessedBlock + 5);
 
-            // Solo transacciones con valor (compras)
-            if (tx.value === '0') continue;
+        for (let i = startBlock; i <= endBlock; i++) {
+            console.log(`📦 Procesando bloque ${i}...`);
 
-            // No procesar si ya la vimos
-            if (processedTxHashes.has(tx.hash)) continue;
+            try {
+                // Obtener bloque con transacciones
+                const block = await provider.getBlockWithTransactions(i);
 
-            // Marcar como procesada
-            processedTxHashes.add(tx.hash);
+                if (block && block.transactions) {
+                    // Filtrar transacciones para nuestro contrato
+                    const lotteryTxs = block.transactions.filter(tx =>
+                        tx.to && tx.to.toLowerCase() === CONFIG.CONTRACT_ADDRESS.toLowerCase()
+                    );
 
-            // Procesar la compra
-            await processTicketPurchase(tx);
+                    if (lotteryTxs.length > 0) {
+                        console.log(`🔎 Encontradas ${lotteryTxs.length} transacciones al contrato en bloque ${i}`);
 
-            // Actualizar último bloque
-            const blockNum = parseInt(tx.blockNumber);
-            if (blockNum > lastProcessedBlock) {
-                lastProcessedBlock = blockNum;
+                        // Analizar cada transacción
+                        for (const tx of lotteryTxs) {
+                            const receipt = await provider.getTransactionReceipt(tx.hash);
+                            if (receipt && receipt.logs) {
+                                for (const log of receipt.logs) {
+                                    // Solo logs que emite nuestro contrato
+                                    if (log.address.toLowerCase() === CONFIG.CONTRACT_ADDRESS.toLowerCase()) {
+                                        await processLog(log, tx.hash);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                lastProcessedBlock = i;
+
+            } catch (err) {
+                console.error(`❌ Error procesando bloque ${i}:`, err.message);
+                if (err.message.includes('rate limit') || err.message.includes('server error')) {
+                    rotateRpc();
+                }
             }
         }
 
-        // Limpiar hashes viejos (mantener solo los últimos 100)
-        if (processedTxHashes.size > 100) {
-            const arr = Array.from(processedTxHashes);
-            processedTxHashes = new Set(arr.slice(-50));
-        }
-
     } catch (error) {
-        console.error('❌ Error en polling:', error.message);
+        console.error('❌ Error general:', error.message);
+        rotateRpc();
+    } finally {
+        isProcessing = false;
     }
 }
 
 // --- INICIO ---
-console.log('🤖 Bot de alertas FairChance iniciado...');
-console.log('📡 Monitoreando contrato:', CONFIG.CONTRACT_ADDRESS);
-console.log('💬 Enviando alertas a Telegram Chat ID:', CONFIG.TELEGRAM_CHAT_ID);
-console.log(`⏰ Polling cada ${CONFIG.POLL_INTERVAL / 1000} segundos`);
+console.log('🤖 Bot FairChance: Modo Block Watcher');
+console.log('📡 Contrato:', CONFIG.CONTRACT_ADDRESS);
 
-// Ejecutar polling inmediatamente y luego cada X segundos
-pollForTransactions();
-setInterval(pollForTransactions, CONFIG.POLL_INTERVAL);
+// Loop principal
+setInterval(checkNewBlocks, CONFIG.POLL_INTERVAL);
 
-// Keep-alive log cada 60 segundos
+// Keep-alive logging
 setInterval(() => {
-    console.log('💓 Bot activo -', new Date().toISOString());
+    console.log(`💓 Bot vivo - Último bloque: ${lastProcessedBlock} - ${new Date().toISOString()}`);
 }, 60000);
 
-// Manejar señales
-process.on('SIGINT', () => {
-    console.log('👋 Bot detenido');
-    process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-    console.log('👋 Bot terminado');
-    process.exit(0);
-});
+// Manejo de señales
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
