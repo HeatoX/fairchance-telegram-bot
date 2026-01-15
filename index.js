@@ -90,13 +90,14 @@ async function getContractBalance() {
 // Obtener transacciones recientes al contrato
 async function getRecentTransactions() {
     try {
-        const url = `https://api.bscscan.com/api?module=account&action=txlist&address=${CONFIG.CONTRACT_ADDRESS}&startblock=0&endblock=99999999&page=1&offset=20&sort=desc`;
-        console.log(`📡 Consultando BscScan: ${url}`);
+        // Usar API V2 de BscScan (chainid 56 = BSC Mainnet)
+        const url = `https://api.bscscan.com/v2/api?chainid=56&module=account&action=txlist&address=${CONFIG.CONTRACT_ADDRESS}&startblock=0&endblock=99999999&page=1&offset=20&sort=desc`;
+        console.log(`📡 Consultando BscScan V2: ${url}`);
 
         const response = await httpGet(url);
-        console.log('🔍 Respuesta BscScan:', JSON.stringify(response));
+        console.log('🔍 Respuesta BscScan:', JSON.stringify(response).slice(0, 200) + '...');
 
-        if (response.status === '1' && response.result) {
+        if (response.status === '1' && Array.isArray(response.result)) {
             return response.result;
         } else {
             console.warn('⚠️ BscScan respuesta no-exitosa:', response.message);
