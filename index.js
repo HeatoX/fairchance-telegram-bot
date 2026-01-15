@@ -14,8 +14,8 @@ const CONFIG = {
     // Tu contrato de lotería en BSC
     CONTRACT_ADDRESS: '0x59d2A5a1518f331550d680A8C777A1c5F0F4D38d',
 
-    // RPC de BSC Mainnet
-    BSC_RPC: 'https://bsc-dataseed1.binance.org/',
+    // RPC de BSC Mainnet (Ankr es más permisivo con getLogs)
+    BSC_RPC: 'https://rpc.ankr.com/bsc',
 
     // Token del bot de Telegram
     TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8297009961:AAG7NweIXk5k7ryokbWJ8Elsbqd_oNN4JaE',
