@@ -17,10 +17,10 @@ const CONFIG = {
     BSC_RPC: 'https://bsc-dataseed1.binance.org/',
 
     // Token del bot de Telegram (obtenerlo de @BotFather)
-    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || 'TU_TOKEN_AQUI',
+    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8297009961:AAG7NweIXk5k7ryokbWJ8Elsbqd_oNN4JaE',
 
     // ID del grupo/canal de Telegram donde enviar alertas
-    TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || 'TU_CHAT_ID_AQUI',
+    TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '-1003418707047',
 
     // Precio aproximado de BNB en USD
     BNB_PRICE_USD: 600
@@ -33,9 +33,37 @@ const CONTRACT_ABI = [
     "event LotteryExtended(uint256 newEndTime, uint256 currentPool)"
 ];
 
-// Inicializar provider y contrato
-const provider = new ethers.providers.JsonRpcProvider(CONFIG.BSC_RPC);
-const contract = new ethers.Contract(CONFIG.CONTRACT_ADDRESS, CONTRACT_ABI, provider);
+// Provider HTTP para leer balance (más confiable)
+const httpProvider = new ethers.providers.JsonRpcProvider(CONFIG.BSC_RPC);
+
+// WebSocket Provider para eventos en tiempo real
+const BSC_WSS = 'wss://bsc-ws-node.nariox.org:443';
+
+let wsProvider;
+let contract;
+
+// Función para conectar WebSocket con reconexión automática
+async function connectWebSocket() {
+    console.log('🔌 Conectando a WebSocket BSC...');
+
+    wsProvider = new ethers.providers.WebSocketProvider(BSC_WSS);
+    contract = new ethers.Contract(CONFIG.CONTRACT_ADDRESS, CONTRACT_ABI, wsProvider);
+
+    // Manejar desconexión
+    wsProvider._websocket.on('close', () => {
+        console.log('⚠️ WebSocket desconectado, reconectando en 5 segundos...');
+        setTimeout(connectWebSocket, 5000);
+    });
+
+    wsProvider._websocket.on('error', (error) => {
+        console.error('❌ Error de WebSocket:', error.message);
+    });
+
+    // Configurar listeners de eventos
+    setupEventListeners();
+
+    console.log('✅ WebSocket conectado, escuchando eventos...');
+}
 
 // Inicializar bot de Telegram
 const bot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { polling: false });
@@ -58,18 +86,18 @@ function formatAddress(address) {
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
-// --- LISTENERS DE EVENTOS ---
+// --- FUNCIÓN PARA CONFIGURAR LISTENERS ---
+function setupEventListeners() {
+    // Cuando alguien compra tickets
+    contract.on('NewTicketBought', async (player, amount, event) => {
+        console.log(`🎟️ Nueva compra detectada: ${amount} tickets`);
 
-// Cuando alguien compra tickets
-contract.on('NewTicketBought', async (player, amount, event) => {
-    console.log(`🎟️ Nueva compra detectada: ${amount} tickets`);
+        // Obtener balance actual del contrato (usar HTTP provider, más confiable)
+        const balance = await httpProvider.getBalance(CONFIG.CONTRACT_ADDRESS);
+        const balanceBNB = parseFloat(ethers.utils.formatEther(balance));
+        const balanceUSD = (balanceBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
 
-    // Obtener balance actual del contrato
-    const balance = await provider.getBalance(CONFIG.CONTRACT_ADDRESS);
-    const balanceBNB = parseFloat(ethers.utils.formatEther(balance));
-    const balanceUSD = (balanceBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
-
-    const message = `
+        const message = `
 🎟️ <b>¡NUEVA COMPRA DE TICKETS!</b>
 
 👤 <b>Jugador:</b> <code>${formatAddress(player)}</code>
@@ -80,15 +108,15 @@ contract.on('NewTicketBought', async (player, amount, event) => {
 <a href="https://heatox.github.io/loteria-crypto/">🎰 Comprar Tickets</a>
 `;
 
-    await sendTelegramMessage(message);
-});
+        await sendTelegramMessage(message);
+    });
 
-// Cuando se elige un ganador
-contract.on('WinnerPicked', async (winner, prize, lotteryId, event) => {
-    const prizeBNB = parseFloat(ethers.utils.formatEther(prize));
-    const prizeUSD = (prizeBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
+    // Cuando se elige un ganador
+    contract.on('WinnerPicked', async (winner, prize, lotteryId, event) => {
+        const prizeBNB = parseFloat(ethers.utils.formatEther(prize));
+        const prizeUSD = (prizeBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
 
-    const message = `
+        const message = `
 🏆🏆🏆 <b>¡TENEMOS GANADOR!</b> 🏆🏆🏆
 
 🎉 <b>Ronda:</b> #${lotteryId.toString()}
@@ -101,16 +129,16 @@ contract.on('WinnerPicked', async (winner, prize, lotteryId, event) => {
 <a href="https://heatox.github.io/loteria-crypto/">🎰 ¡Nueva Ronda Iniciada!</a>
 `;
 
-    await sendTelegramMessage(message);
-});
+        await sendTelegramMessage(message);
+    });
 
-// Cuando se extiende la lotería
-contract.on('LotteryExtended', async (newEndTime, currentPool, event) => {
-    const poolBNB = parseFloat(ethers.utils.formatEther(currentPool));
-    const poolUSD = (poolBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
-    const endDate = new Date(newEndTime.toNumber() * 1000).toLocaleString('es-ES');
+    // Cuando se extiende la lotería
+    contract.on('LotteryExtended', async (newEndTime, currentPool, event) => {
+        const poolBNB = parseFloat(ethers.utils.formatEther(currentPool));
+        const poolUSD = (poolBNB * CONFIG.BNB_PRICE_USD).toFixed(2);
+        const endDate = new Date(newEndTime.toNumber() * 1000).toLocaleString('es-ES');
 
-    const message = `
+        const message = `
 ⏰ <b>RONDA EXTENDIDA</b>
 
 El pozo no alcanzó el mínimo, así que la ronda se ha extendido.
@@ -123,16 +151,35 @@ El pozo no alcanzó el mínimo, así que la ronda se ha extendido.
 <a href="https://heatox.github.io/loteria-crypto/">🎰 Comprar Más Tickets</a>
 `;
 
-    await sendTelegramMessage(message);
-});
+        await sendTelegramMessage(message);
+    });
+}
 
 // --- INICIO ---
-console.log('🤖 Bot de alertas FairChance iniciado...');
-console.log('📡 Escuchando eventos del contrato:', CONFIG.CONTRACT_ADDRESS);
-console.log('💬 Enviando alertas a Telegram Chat ID:', CONFIG.TELEGRAM_CHAT_ID);
+async function main() {
+    console.log('🤖 Bot de alertas FairChance iniciado...');
+    console.log('📡 Escuchando eventos del contrato:', CONFIG.CONTRACT_ADDRESS);
+    console.log('💬 Enviando alertas a Telegram Chat ID:', CONFIG.TELEGRAM_CHAT_ID);
 
-// Mantener el proceso vivo
+    // Conectar WebSocket
+    await connectWebSocket();
+
+    // Keep-alive: hacer ping cada 30 segundos para mantener el proceso vivo
+    setInterval(() => {
+        console.log('💓 Bot activo...', new Date().toISOString());
+    }, 30000);
+}
+
+// Manejar señales de terminación
 process.on('SIGINT', () => {
     console.log('👋 Bot detenido');
     process.exit();
 });
+
+process.on('SIGTERM', () => {
+    console.log('👋 Bot terminado por Railway');
+    process.exit();
+});
+
+// Iniciar
+main().catch(console.error);
